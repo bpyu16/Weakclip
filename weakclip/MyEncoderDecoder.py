@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.modules import SyncBatchNorm, BatchNorm2d, GroupNorm, LayerNorm
+from torch.nn.modules import  BatchNorm2d, GroupNorm, LayerNorm
 import numpy as np
 
 from mmseg.core import add_prefix

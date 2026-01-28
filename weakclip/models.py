@@ -10,14 +10,15 @@ from mmseg.models.builder import BACKBONES
 
 from mmseg.models.backbones import ResNet
 from mmseg.models.backbones import VisionTransformer as MMVisionTransformer
-
+from typing import Union, List
 from timm.models.resnet import ResNet as TimmResNet
 from timm.models.resnet import Bottleneck as TimmBottleneck
-
+from .load_attr import attr_aggregate
 import math
 from timm.models.vision_transformer import VisionTransformer
-
-
+import clip
+from pkg_resources import packaging
+from .untils import tokenize
 def fix_bn(m):
     classname = m.__class__.__name__
     if classname.find('BatchNorm') != -1:
@@ -246,8 +247,8 @@ class CLIPResNetWithAttention(nn.Module):
             self.fpn1 = nn.Sequential(
                 nn.GroupNorm(1, width * 4),
                 nn.Conv2d(width * 4, width * 4, kernel_size=3, padding=1),
-                nn.SyncBatchNorm(width * 4),
-                # nn.BatchNorm2d(width * 4),
+                #nn.SyncBatchNorm(width * 4),
+                nn.BatchNorm2d(width * 4),
                 nn.GELU(),
                 nn.Conv2d(width * 4, width * 4, kernel_size=3, padding=1),
             )
@@ -374,10 +375,30 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = attn_mask
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
+    """
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+    """
+    
+    def attention(self, x):
+        """
+        x: [L, B, C]
+        """
+        # ===== Case 1: 原始 CLIP MultiheadAttention =====
+        if isinstance(self.attn, nn.MultiheadAttention):
+            self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+            return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        # ===== Case 2: 你自定义的 Attention (q, k, v) =====
+        else:
+            # [L, B, C] -> [B, N, C]
+            x_in = x.permute(1, 0, 2)
+
+            # self-attention: q = k = v
+            out = self.attn(x_in, x_in, x_in)
+
+            # [B, N, C] -> [L, B, C]
+            return out.permute(1, 0, 2)
 
     def forward(self, x: torch.Tensor):
         x = x + self.drop_path(self.attention(self.ln_1(x)))
@@ -433,6 +454,78 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+# implement attention module for v-v self-attention
+class ModifyAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        qkv_bias=False,
+        qk_scale=None,
+        attn_drop=0.,
+        proj_drop=0.
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, q, k, v):
+        """
+        q, k, v: [B, N, C]
+        """
+        B, N, C = q.shape
+        _, M, _ = k.shape
+        assert k.shape == v.shape
+
+        # === Linear projections ===
+        q = self.q_proj(q).reshape(B, N, self.num_heads, C // self.num_heads)
+        k = self.k_proj(k).reshape(B, M, self.num_heads, C // self.num_heads)
+        v = self.v_proj(v).reshape(B, M, self.num_heads, C // self.num_heads)
+
+        # [B, N, H, D] -> [B, H, N, D]
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        scale = self.scale
+
+        # =========================================================
+        # Modified attention (Q-Q, K-K, V-V)
+        # =========================================================
+        attn1 = (q @ q.transpose(-2, -1)) * scale   # [B, H, N, N]
+        attn2 = (k @ k.transpose(-2, -1)) * scale   # [B, H, M, M]
+        attn3 = (v @ v.transpose(-2, -1)) * scale   # [B, H, M, M]
+
+        attn1 = attn1.softmax(dim=-1)
+        attn2 = attn2.softmax(dim=-1)
+        attn3 = attn3.softmax(dim=-1)
+
+        # 如果是 self-attention，N == M
+        attn = (attn1 + attn2 + attn3) / 3.0
+        attn = self.attn_drop(attn)
+        # =========================================================
+
+        # === Apply attention ===
+        # attn: [B, H, N, N], v: [B, H, N, D]
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+
+        # === Output projection ===
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x
+
+
+        
 class TransformerDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -480,7 +573,11 @@ class CLIPVisionTransformer(nn.Module):
         self.spatial_size = input_resolution // patch_size
         self.ln_pre = LayerNorm(width)
         self.get_embeddings = get_embeddings
-
+        
+        self.attn = None
+        self.embed_dim = width
+        self.num_heads = heads
+        
         self.transformer = Transformer(width, layers, heads, drop_path_rate=drop_path_rate)
 
         self.out_indices = out_indices
@@ -494,12 +591,12 @@ class CLIPVisionTransformer(nn.Module):
             self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
         embed_dim = width
-
+        # BatchNorm2d
         if (patch_size == 16 or patch_size == 14) and if_fpn:
             self.fpn1 = nn.Sequential(
                 nn.GroupNorm(1, embed_dim),
                 nn.ConvTranspose2d(embed_dim, embed_dim, kernel_size=2, stride=2),
-                nn.SyncBatchNorm(embed_dim),
+                nn.BatchNorm2d(embed_dim),
                 nn.GELU(),
                 nn.ConvTranspose2d(embed_dim, embed_dim, kernel_size=2, stride=2),
             )
@@ -533,6 +630,62 @@ class CLIPVisionTransformer(nn.Module):
                 nn.GroupNorm(1, embed_dim),
                 nn.MaxPool2d(kernel_size=4, stride=4),
             )
+    
+    @torch.no_grad()
+    def reload_self_attn(self, layers=6, feat_size=20, mode='train'):
+        """
+        替换最后 layers 个 Transformer Block 的 Attention 为 ModifyAttention，
+        并迁移权重。适配 pos_embed 大小。
+
+        Args:
+            layers (int): 替换最后多少层
+            feat_size (int): 特征图大小（H/W）
+            mode (str): 'train' 或 'test'，控制 pos_embed 是否 resize
+        """
+        if getattr(self, 'attn', None) is None:
+            # 替换最后 layers 个 block
+            for i in range(1, layers + 1):
+                old_attn = self.transformer.resblocks[-i].attn
+                new_attn = ModifyAttention(
+                    dim=self.embed_dim,
+                    num_heads=self.num_heads,
+                    qkv_bias=True
+                )
+
+                # === 权重迁移 ===
+                d = self.embed_dim
+                # q_proj
+                new_attn.q_proj.weight.data.copy_(old_attn.in_proj_weight[:d, :])
+                new_attn.q_proj.bias.data.copy_(old_attn.in_proj_bias[:d])
+                # k_proj
+                new_attn.k_proj.weight.data.copy_(old_attn.in_proj_weight[d:2*d, :])
+                new_attn.k_proj.bias.data.copy_(old_attn.in_proj_bias[d:2*d])
+                # v_proj
+                new_attn.v_proj.weight.data.copy_(old_attn.in_proj_weight[2*d:3*d, :])
+                new_attn.v_proj.bias.data.copy_(old_attn.in_proj_bias[2*d:3*d])
+                # proj
+                new_attn.proj.weight.data.copy_(old_attn.out_proj.weight)
+                new_attn.proj.bias.data.copy_(old_attn.out_proj.bias)
+
+                self.transformer.resblocks[-i].attn = new_attn
+
+            self.attn = True  # 标记已替换
+
+        # === positional embedding resize ===
+        if 'train' in mode:
+            # 原始 pos_embed: [1 + old_side*old_side, embed_dim]
+            old_num_tokens, d = self.positional_embedding.shape
+            cls_token = self.positional_embedding[:1, :]  # [1, d]
+            pos_tokens = self.positional_embedding[1:, :].reshape(1, int((old_num_tokens-1)**0.5),
+                                                                  int((old_num_tokens-1)**0.5), d).permute(0, 3, 1, 2)
+            # 插值
+            new_pos = F.interpolate(pos_tokens, size=(feat_size, feat_size), mode='bilinear', align_corners=False)
+            new_pos = new_pos.permute(0, 2, 3, 1).reshape(feat_size*feat_size, d)
+            self.positional_embedding.data.copy_(torch.cat([cls_token, new_pos], dim=0))
+
+        return
+
+
 
         
     def init_weights(self, pretrained=None):
@@ -677,6 +830,8 @@ class CLIPTextEncoder(nn.Module):
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
         # x = self.out_proj(x)
         return x
+    
+
 
 
 @BACKBONES.register_module()
@@ -739,7 +894,7 @@ class CLIPTextContextEncoder(nn.Module):
              
             u, w = self.load_state_dict(state_dict, False)
             print(u, w, 'are misaligned params in text encoder')
-
+            
 
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -749,10 +904,63 @@ class CLIPTextContextEncoder(nn.Module):
         mask.triu_(1)  # zero out the lower diagonal
         return mask
     # text's shape: torch.Size([21, 5])   || context's shape: torch.Size([1, 8, 512])
+    
+    def encode_text(self, text):
+        x = self.token_embedding(text)  # [batch_size, n_ctx, d_model]
+        #print(f"DEBUG: x shape: {x.shape}")
+        #print(f"DEBUG: pos shape: {self.positional_embedding.shape}")
+        # 获取位置编码的实际长度 (这里是 13)
+        max_len = self.positional_embedding.shape[0]
+        
+        # 如果输入的长度 (77) 超过了位置编码的长度 (13)，就强行裁剪
+        if x.shape[1] > max_len:
+            x = x[:, :max_len, :]
+        # -----------------------------------------------------
+
+        # 原有的加法代码 (现在 x 和 pos 的长度都能对上了)
+        # 注意：使用更稳健的切片写法
+        x = x + self.positional_embedding[:x.size(1), :]
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x)
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+        # x = self.out_proj(x)
+        return x
+    
+    def encode_text_with_prompt_ensemble(self):
+        BACKGROUND_CATEGORY = ['ground','land','grass','tree','building','wall','sky','lake','water','river','sea','railway','railroad','keyboard','helmet',
+                            'cloud','house','mountain','ocean','road','rock','street','valley','bridge','sign',
+                            ]
+        new_class_names = ['aeroplane', 'bicycle', 'bird avian', 'boat', 'bottle',
+                       'bus', 'car', 'cat', 'chair seat', 'cow',
+                       'diningtable', 'dog', 'horse', 'motorbike', 'person with clothes,people,human',
+                       'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor screen',
+                       ]
+        texts = new_class_names+BACKGROUND_CATEGORY 
+        prompt_templates=['a clean origami {}.']
+        device = next(self.parameters()).device
+        text_features = []
+        for t in texts:
+            prompted_t = [template.format(t) for template in prompt_templates]
+            prompted_t = tokenize(prompted_t).to(device)
+            class_embeddings = self.encode_text(prompted_t)
+            class_embeddings = class_embeddings / class_embeddings.norm(dim=-1, keepdim=True)
+            class_embedding = class_embeddings.mean(dim=0)
+            class_embedding = class_embedding / class_embedding.norm(dim=-1, keepdim=True)
+            text_features.append(class_embedding)
+        text_features = torch.stack(text_features, dim=1).to(device).t()
+
+        return text_features
+    
     def forward(self, text, context=None):
+        integral_text_features = self.encode_text_with_prompt_ensemble()
+        text_attr, attr_flag = attr_aggregate(integral_text_features, dataset_name='pascal_voc', num_classes=20, num_atrr_clusters=112, json_file='./attributes_text/descriptors_pascal_voc_gpt4.0_cluster_a_photo_of4.json')
+        text_attr = text_attr.permute(1,0)
         if context != None:
             x_text = self.token_embedding(text)  # n_clas, n_text, C torch.Size([21, 5, 512])
-
+            x_text[:, 1, :] = text_attr[:21]
+            
             K, N1, C = x_text.shape # K:1` N1:5 C:512
             B, N2, C = context.shape # B:1 N2:8 C:512
 

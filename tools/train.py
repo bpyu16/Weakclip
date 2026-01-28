@@ -5,6 +5,11 @@ import os.path as osp
 import time
 import mmcv
 import torch
+import torch.nn as nn
+
+# ===== 强制禁用 SyncBatchNorm（单卡）=====
+nn.SyncBatchNorm = nn.BatchNorm2d
+
 from mmcv.runner import init_dist
 from mmcv.utils import Config, DictAction, get_git_hash
 from mmseg import __version__
@@ -14,7 +19,8 @@ from mmseg.models import build_segmentor
 from mmseg.utils import collect_env, get_root_logger
 import weakclip
 
-
+import sys
+sys.path.append("./")
 
 def fix_bn(m):
     classname = m.__class__.__name__
@@ -150,13 +156,20 @@ def main():
 
     model.backbone.init_weights()
     # model.init_weights()
-
+    """
+    model.backbone.reload_self_attn(
+        layers=6,
+        feat_size=512 // 16,   # 或从 cfg / img_size 动态算
+        mode='train'
+    )
+    """
     if hasattr(model, 'text_encoder'):
         model.text_encoder.init_weights()
 
     # todo: change addly norm to syncbn
     if not args.fix_clip_bn:
-        model.backbone = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model.backbone)
+        pass
+        #model.backbone = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model.backbone)
 
     logger.info(model)
 

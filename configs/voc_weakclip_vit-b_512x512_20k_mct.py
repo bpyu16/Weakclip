@@ -16,8 +16,8 @@ optimizer = dict(paramwise_cfg=dict(custom_keys={'backbone': dict(lr_mult=0.0),
                                         }))
 
 data = dict(
-    samples_per_gpu=8,
-    workers_per_gpu=8,
+    samples_per_gpu=4,
+    workers_per_gpu=4,
     test=dict(
         ann_dir='SegmentationClassAug',
         split='ImageSets/Segmentation/trainaug.txt',
